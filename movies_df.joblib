@@ -1,219 +1,94 @@
+import streamlit as st
 import pandas as pd
-import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from ast import literal_eval
-from nltk.stem.snowball import SnowballStemmer
 import joblib
-
-print("--- Movie Recommender Model Creation ---")
-
-# --- 1. Load All Datasets ---
-print("Step 1: Loading all required datasets...")
-md = pd.read_csv('../input/movies_metadata.csv', low_memory=False)
-credits = pd.read_csv('../input/credits.csv')
-keywords = pd.read_csv('../input/keywords.csv')
-links_small = pd.read_csv('../input/links_small.csv')
-
-# --- 2. Initial Cleaning and Filtering to Small Dataset ---
-print("Step 2: Cleaning and filtering data to the small dataset...")
-# Safely drop known bad rows from the original metadata file
-md = md.drop([19730, 29503, 35587], errors='ignore')
-
-# Clean and convert ID columns
-md['id'] = pd.to_numeric(md['id'], errors='coerce')
-md.dropna(subset=['id'], inplace=True)
-md['id'] = md['id'].astype('int')
-
-# Get the list of movie IDs from the small dataset
-links_small = links_small[links_small['tmdbId'].notnull()]['tmdbId'].astype('int')
-small_movie_ids = set(links_small)
-
-# Filter the main dataframe to only include movies from the small dataset
-smd = md[md['id'].isin(small_movie_ids)].copy()
-print(f"   > Original 'small' dataset size: {len(smd)} movies.")
-
-# --- 3. Filter to Top N Most Popular Movies ---
-print("Step 3: Filtering down to the most popular movies to reduce model size...")
-# Calculate the components for the Weighted Rating (IMDB's formula)
-vote_counts = smd[smd['vote_count'].notnull()]['vote_count'].astype('int')
-vote_averages = smd[smd['vote_average'].notnull()]['vote_average'].astype('float')
-C = vote_averages.mean()
-m = vote_counts.quantile(0.60) # Set the minimum votes required to be in the 60th percentile
-
-# Define the weighted rating function
-def weighted_rating(x):
-    v = x['vote_count']
-    R = x['vote_average']
-    return (v / (v + m) * R) + (m / (m + v) * C)
-
-# Apply the function and sort to find the most popular movies
-smd['wr'] = smd.apply(weighted_rating, axis=1)
-N = 2500 # Define the number of top movies to keep
-smd = smd.sort_values('wr', ascending=False).head(N)
-print(f"   > Filtered down to the top {N} most popular movies.")
-
-# --- 4. Feature Engineering ('soup' creation) ---
-print("Step 4: Engineering features from metadata (cast, director, genres, keywords)...")
-# Merge with credits and keywords dataframes
-smd = smd.merge(credits, on='id')
-smd = smd.merge(keywords, on='id')
-
-# Define a safe function for literal_eval to prevent errors on re-runs
-def safe_literal_eval(val):
-    if isinstance(val, list): return val
-    try: return literal_eval(val)
-    except: return []
-
-for feature in ['genres', 'cast', 'crew', 'keywords']:
-    smd[feature] = smd[feature].apply(safe_literal_eval)
-
-# Extract director, top 3 cast, genres, and stem keywords
-def get_director(x):
-    for i in x:
-        if i['job'] == 'Director':
-            return i['name']
-    return ''
-smd['director'] = smd['crew'].apply(get_director)
-
-for feature in ['cast', 'keywords', 'genres']:
-    smd[feature] = smd[feature].apply(lambda x: [i['name'] for i in x])
-smd['cast'] = smd['cast'].apply(lambda x: x[:3] if len(x) >= 3 else x)
-
-stemmer = SnowballStemmer('english')
-smd['keywords'] = smd['keywords'].apply(lambda x: [stemmer.stem(i) for i in x])
-
-def sanitize(x):
-    if isinstance(x, list):
-        return [str.lower(i.replace(" ", "")) for i in x]
-    return str.lower(x.replace(" ", "")) if isinstance(x, str) else ''
-
-for feature in ['cast', 'keywords', 'director', 'genres']:
-    smd[feature] = smd[feature].apply(sanitize)
-
-# Create the final metadata "soup"
-smd['director'] = smd['director'].apply(lambda x: [x, x, x]) # Weight director
-smd['soup'] = smd['keywords'] + smd['cast'] + smd['director'] + smd['genres']
-smd['soup'] = smd['soup'].apply(lambda x: ' '.join(x))
-print("   > Feature 'soup' created.")
-
-# --- 5. Vectorization and Similarity Calcula
-import pandas as pd
+import requests
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from ast import literal_eval
-from nltk.stem.snowball import SnowballStemmer
-import joblib
 
-print("--- Movie Recommender Model Creation ---")
+# --- Page Configuration ---
+st.set_page_config(layout="wide")
 
-# --- 1. Load All Datasets ---
-print("Step 1: Loading all required datasets...")
-md = pd.read_csv('../input/movies_metadata.csv', low_memory=False)
-credits = pd.read_csv('../input/credits.csv')
-keywords = pd.read_csv('../input/keywords.csv')
-links_small = pd.read_csv('../input/links_small.csv')
+# --- Function to fetch movie poster ---
+def fetch_poster(movie_id):
+    """Fetches a movie poster URL from the TMDB API using a secret key."""
+    try:
+        api_key = st.secrets["TMDB_API_KEY"]
+        url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={api_key}&language=en-US"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        poster_path = data.get('poster_path')
+        if poster_path:
+            return "https://image.tmdb.org/t/p/w500/" + poster_path
+    except Exception as e:
+        print(f"Error fetching poster: {e}") # Log error for debugging
+    return "https://via.placeholder.com/500x750.png?text=No+Poster+Found"
+# --- Function to load saved model assets ---
+@st.cache_resource
+def load_model_assets():
+    """Loads the pre-saved movie DataFrame and cosine similarity matrix."""
+    try:
+        movies_df = joblib.load('movies_df.joblib')
+        cosine_sim = joblib.load('cosine_sim_matrix.joblib')
+        return movies_df, cosine_sim
+    except FileNotFoundError:
+        return None, None
 
-# --- 2. Initial Cleaning and Filtering to Small Dataset ---
-print("Step 2: Cleaning and filtering data to the small dataset...")
-# Safely drop known bad rows from the original metadata file
-md = md.drop([19730, 29503, 35587], errors='ignore')
+# --- Recommendation Logic ---
+def get_recommendations(title, movies_df, cosine_sim):
+    """Generates movie recommendations for a given title."""
+    indices = pd.Series(movies_df.index, index=movies_df['title'])
+    idx = indices[title]
+    sim_scores = list(enumerate(cosine_sim[idx].astype(float)))
+    
+    def robust_sort_key(item):
+        score = item[1]
+        if isinstance(score, (int, float, np.number)) and np.isfinite(score):
+            return score
+        else:
+            return -float('inf')
 
-# Clean and convert ID columns
-md['id'] = pd.to_numeric(md['id'], errors='coerce')
-md.dropna(subset=['id'], inplace=True)
-md['id'] = md['id'].astype('int')
+    sim_scores = sorted(sim_scores, key=robust_sort_key, reverse=True)
+    sim_scores = sim_scores[1:11]
+    movie_indices = [i[0] for i in sim_scores]
+    return movies_df['title'].iloc[movie_indices], movies_df['id'].iloc[movie_indices]
+# --- Custom CSS and UI ---
+st.markdown("""
+<style>
+    .stApp { background-color: #0E1117; color: #FAFAFA; }
+    .stSelectbox div[data-baseweb="select"] > div { background-color: #262730; }
+    .stButton>button { background-color: #4B8BBE; color: white; border-radius: 8px; border: none; padding: 10px 24px; text-align: center; text-decoration: none; display: inline-block; font-size: 16px; margin: 4px 2px; cursor: pointer; }
+    .movie-title { font-size: 14px; font-weight: bold; text-align: center; margin-top: 8px; height: 50px; overflow: hidden; text-overflow: ellipsis; }
+</style>
+""", unsafe_allow_html=True)
 
-# Get the list of movie IDs from the small dataset
-links_small = links_small[links_small['tmdbId'].notnull()]['tmdbId'].astype('int')
-small_movie_ids = set(links_small)
+st.title("PragyanAI - Super 30 Movie Recommender System")
+movies_df, cosine_sim = load_model_assets()
 
-# Filter the main dataframe to only include movies from the small dataset
-smd = md[md['id'].isin(small_movie_ids)].copy()
-print(f"   > Original 'small' dataset size: {len(smd)} movies.")
-
-# --- 3. Filter to Top N Most Popular Movies ---
-print("Step 3: Filtering down to the most popular movies to reduce model size...")
-# Calculate the components for the Weighted Rating (IMDB's formula)
-vote_counts = smd[smd['vote_count'].notnull()]['vote_count'].astype('int')
-vote_averages = smd[smd['vote_average'].notnull()]['vote_average'].astype('float')
-C = vote_averages.mean()
-m = vote_counts.quantile(0.60) # Set the minimum votes required to be in the 60th percentile
-
-# Define the weighted rating function
-def weighted_rating(x):
-    v = x['vote_count']
-    R = x['vote_average']
-    return (v / (v + m) * R) + (m / (m + v) * C)
-
-# Apply the function and sort to find the most popular movies
-smd['wr'] = smd.apply(weighted_rating, axis=1)
-N = 2500 # Define the number of top movies to keep
-smd = smd.sort_values('wr', ascending=False).head(N)
-print(f"   > Filtered down to the top {N} most popular movies.")
-# --- 4. Feature Engineering ('soup' creation) ---
-print("Step 4: Engineering features from metadata (cast, director, genres, keywords)...")
-# Merge with credits and keywords dataframes
-smd = smd.merge(credits, on='id')
-smd = smd.merge(keywords, on='id')
-
-# Define a safe function for literal_eval to prevent errors on re-runs
-def safe_literal_eval(val):
-    if isinstance(val, list): return val
-    try: return literal_eval(val)
-    except: return []
-
-for feature in ['genres', 'cast', 'crew', 'keywords']:
-    smd[feature] = smd[feature].apply(safe_literal_eval)
-
-# Extract director, top 3 cast, genres, and stem keywords
-def get_director(x):
-    for i in x:
-        if i['job'] == 'Director':
-            return i['name']
-    return ''
-smd['director'] = smd['crew'].apply(get_director)
-
-for feature in ['cast', 'keywords', 'genres']:
-    smd[feature] = smd[feature].apply(lambda x: [i['name'] for i in x])
-smd['cast'] = smd['cast'].apply(lambda x: x[:3] if len(x) >= 3 else x)
-
-stemmer = SnowballStemmer('english')
-smd['keywords'] = smd['keywords'].apply(lambda x: [stemmer.stem(i) for i in x])
-
-def sanitize(x):
-    if isinstance(x, list):
-        return [str.lower(i.replace(" ", "")) for i in x]
-    return str.lower(x.replace(" ", "")) if isinstance(x, str) else ''
-
-for feature in ['cast', 'keywords', 'director', 'genres']:
-    smd[feature] = smd[feature].apply(sanitize)
-
-# Create the final metadata "soup"
-smd['director'] = smd['director'].apply(lambda x: [x, x, x]) # Weight director
-smd['soup'] = smd['keywords'] + smd['cast'] + smd['director'] + smd['genres']
-smd['soup'] = smd['soup'].apply(lambda x: ' '.join(x))
-print("   > Feature 'soup' created.")
-
-# --- 5. Vectorization and Similarity Calculation ---
-print("Step 5: Calculating the final similarity matrix...")
-count = TfidfVectorizer(analyzer='word', ngram_range=(1, 2), min_df=0, stop_words='english')
-count_matrix = count.fit_transform(smd['soup'])
-cosine_sim = cosine_similarity(count_matrix, count_matrix)
-cosine_sim = cosine_sim.astype(np.float16) # Convert to float16 to save space
-print(f"   > Final matrix of shape {cosine_sim.shape} created.")
-print(f"   > Final matrix size: {cosine_sim.nbytes / 1024**2:.2f} MB")
-
-# --- 6. Save the Final Model Components ---
-print("Step 6: Saving the final model components to disk...")
-# We only need the movie titles and the similarity matrix for the app
-smd = smd.reset_index()
-final_df = smd[['title', 'id']].copy() 
-
-joblib.dump(final_df, 'movies_df.joblib')
-joblib.dump(cosine_sim, 'cosine_sim_matrix.joblib')
-
-print("\n✅ Success! The following files have been created:")
-print("   1. movies_df.joblib")
-print("   2. cosine_sim_matrix.joblib")
+if movies_df is not None and cosine_sim is not None:
+    st.sidebar.header("Find Your Next Movie")
+    movie_options = movies_df['title'].sort_values().unique()
+    selected_movie = st.sidebar.selectbox("Select a movie you've enjoyed:", movie_options)
+    
+    if st.sidebar.button("Recommend"):
+        if selected_movie:
+            with st.spinner('Curating a list of movies just for you...'):
+                rec_titles, rec_ids = get_recommendations(selected_movie, movies_df, cosine_sim)
+                
+                # THE FIX IS HERE: Check the number of recommendations before displaying
+                num_recs = len(rec_titles)
+                
+                if num_recs > 0:
+                    st.subheader(f"Because you watched '{selected_movie}', you might like...")
+                    
+                    # Create a dynamic grid that adapts to the number of recommendations
+                    cols = st.columns(5)
+                    for i in range(num_recs):
+                        col = cols[i % 5]
+                        with col:
+                            st.image(fetch_poster(rec_ids.iloc[i]))
+                            st.markdown(f"<p class='movie-title'>{rec_titles.iloc[i]}</p>", unsafe_allow_html=True)
+                else:
+                    st.warning("Could not find any similar movies.")
+else:
+    st.error("🚨 Model files not found!")
+    st.warning("Please run the updated training script first.")
